@@ -1,24 +1,19 @@
-/*
-To Do:
-	* Add cfg option to disable hyperscroll detection...maybe if jumps is set to 0?
-	* Code in natives to ignore a client. This would allow other plugins to ignore them, give them bhop hacks, later turn off hacks, then re-enable this plugin checking them.
-	
-need to add checks into togsjumpstats to see if sourcebans is loaded
-RegPluginLibrary("sourcebans");
-BanClient(
-*/
-
 #pragma semicolon 1
-#define PLUGIN_VERSION "1.11.1"
+#define PLUGIN_VERSION "1.11.2"
 #define TAG "{fullred}[TOGs Jump Stats] {default}"
 #define CSGO_RED "\x07"
 #define CSS_RED "\x07FF0000"
+#define STORAGE_FILE 0
+#define STORAGE_MYSQL 1
+#define STORAGE_CLIENTPREFS 2
 
 #include <sourcemod>
 #include <morecolors>
 #include <sdktools>
 #include <autoexecconfig>
 #include <togsjumpstats1>
+#include <clientprefs>
+#include <adminmenu>
 #undef REQUIRE_PLUGIN
 #include <sourcebanspp>
 #include <discordWebhookAPI>
@@ -68,6 +63,10 @@ ConVar g_cCountBots = null;
 ConVar g_cvWebhook;
 ConVar g_cvCapSpeedMethod = null;
 ConVar g_cvSpeedCapTimer = null;
+ConVar g_hDisableHyperscroll;
+ConVar g_hStorageMethod;
+ConVar g_hDatabaseName;
+ConVar g_hWhitelistEnabled;
 
 float ga_fAvgJumps[MAXPLAYERS + 1] = {1.0, ...};
 float ga_fAvgSpeed[MAXPLAYERS + 1] = {250.0, ...};
@@ -89,6 +88,14 @@ bool ga_bNerfed[MAXPLAYERS + 1] = {false, ...};
 bool g_bWaitingForRoundEnd[MAXPLAYERS+1] = {false, ...};
 bool g_Plugin_SourceBans = false;
 bool g_bRoundCapped[MAXPLAYERS + 1];
+bool g_bClientWhitelisted[MAXPLAYERS + 1];
+bool g_bClientIgnored[MAXPLAYERS + 1];
+bool g_bClientPermanentCapped[MAXPLAYERS + 1];
+
+Handle g_hWhitelistDB = INVALID_HANDLE;
+Handle g_hCapDB = INVALID_HANDLE;
+Handle g_hWhitelistCookie = INVALID_HANDLE;
+Handle g_hCapCookie = INVALID_HANDLE;
 
 char g_sHypPath[PLATFORM_MAX_PATH];
 char g_sHacksPath[PLATFORM_MAX_PATH];
@@ -109,16 +116,21 @@ int g_iTickCount = 1;
 bool g_bDisableAdminMsgs = false;
 bool g_bCSGO = false;
 
+TopMenu g_hTopMenu;
+TopMenuObject g_togsCategory = INVALID_TOPMENUOBJECT;
+
 public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int err_max)
 {
     RegPluginLibrary("TogsJumpStats");
     
     CreateNative("TJS_ClientDetected", Native_ClientDetected);
     CreateNative("TJS_ClientNerfed", Native_ClientNerfed);
+    CreateNative("TJS_ClientIsPermanentCapped", Native_ClientIsPermanentCapped);
+    CreateNative("TJS_ClientIsWhitelisted", Native_ClientIsWhitelisted);
+    CreateNative("TJS_IgnoreClient", Native_IgnoreClient);
     
     return APLRes_Success;
 }
-
 stock char[] GetPluginAuthor()
 {
     char sAuthor[256];
@@ -186,6 +198,12 @@ public void OnPluginStart()
     
     AutoExecConfig_SetFile("togsjumpstats");
     AutoExecConfig_CreateConVar("tjs_version", PLUGIN_VERSION, "TOGs Jump Stats Version", FCVAR_NOTIFY|FCVAR_DONTRECORD);
+
+    TopMenu topmenu;
+    if (LibraryExists("adminmenu") && ((topmenu = GetAdminTopMenu()) != null))
+    {
+        OnAdminMenuReady(topmenu);
+    }
     
     g_hCooldown = AutoExecConfig_CreateConVar("tjs_gen_cooldown", "60", "Cooldown time between chat notifications to admins for any given clients that is flagged.", FCVAR_NONE, true, 0.0);
     
@@ -239,6 +257,14 @@ public void OnPluginStart()
 
     g_cvSpeedCapTimer = AutoExecConfig_CreateConVar("tjs_capspeed_timer", "30", "Timer to cap speed for flagged players (in seconds).", FCVAR_NONE, true, 0.0, true, 90.0);
 
+    g_hDisableHyperscroll = AutoExecConfig_CreateConVar("tjs_disable_hyperscroll", "0", "Disable hyperscroll detection (0 = enabled, 1 = disabled)", FCVAR_NONE, true, 0.0, true, 1.0);
+    g_hStorageMethod = AutoExecConfig_CreateConVar("tjs_storage_method", "1", "Storage method (0 = file, 1 = MySQL, 2 = clientprefs)", _, true, 0.0, true, 2.0);
+    g_hDatabaseName = AutoExecConfig_CreateConVar("tjs_database_name", "togsjumpstats", "Database name for MySQL storage", FCVAR_NONE);
+    g_hWhitelistEnabled = AutoExecConfig_CreateConVar("tjs_whitelist_enabled", "1", "Enable whitelist functionality", FCVAR_NONE, true, 0.0, true, 1.0);
+
+    g_hWhitelistCookie = RegClientCookie("tjs_whitelist", "TOGs Jump Stats Whitelist", CookieAccess_Protected);
+    g_hCapCookie = RegClientCookie("tjs_capped", "TOGs Jump Stats Capped Players", CookieAccess_Protected);
+
     HookEvent("player_jump", Event_PlayerJump, EventHookMode_Post);
     
     BuildPath(Path_SM, g_sHypPath, sizeof(g_sHypPath), "logs/togsjumpstats/hyperscrollers.log");
@@ -253,6 +279,10 @@ public void OnPluginStart()
     RegConsoleCmd("sm_observejumps", Command_ObserveJumps, "Observe a player's jumps in spectator mode.");
     RegConsoleCmd("sm_capplayer", Command_CapPlayer, "Cap a specific player's speed.");
     RegConsoleCmd("sm_removenerf", Command_RemoveNerf, "Removes nerf from a player");
+    RegAdminCmd("sm_whitelist", Command_Whitelist, ADMFLAG_BAN, "Whitelist a player from jump stats detection");
+    RegAdminCmd("sm_whitelist_player", Command_WhitelistPlayer, ADMFLAG_BAN, "Whitelist a player by SteamID");
+    RegAdminCmd("sm_removewhitelist", Command_RemoveWhitelist, ADMFLAG_BAN, "Remove a player from the whitelist.");
+    
     
     AutoExecConfig_ExecuteFile();
     AutoExecConfig_CleanFile();
@@ -291,6 +321,497 @@ public void OnPluginStart()
 	//CreateNative("TJS_ClientNerfed", Native_ClientNerfed);
 	
 	CreateTimer(0.1, Timer_CheckSpeed, _, TIMER_REPEAT);
+}
+
+
+public void OnAdminMenuReady(Handle topmenu)
+{
+    if (g_hTopMenu == TopMenu.FromHandle(topmenu))
+        return;
+
+    g_hTopMenu = TopMenu.FromHandle(topmenu);
+    
+    g_togsCategory = g_hTopMenu.AddCategory("togsjumpstats", AdminMenu_CategoryHandler);
+    if (g_togsCategory != INVALID_TOPMENUOBJECT)
+    {
+        g_hTopMenu.AddItem("tjs_check_stats", AdminMenu_CheckStats, g_togsCategory, "sm_jumps", ADMFLAG_GENERIC);
+        g_hTopMenu.AddItem("tjs_reset_stats", AdminMenu_ResetStats, g_togsCategory, "sm_resetjumps", ADMFLAG_GENERIC);
+        g_hTopMenu.AddItem("tjs_observe_jumps", AdminMenu_ObserveJumps, g_togsCategory, "sm_observejumps", ADMFLAG_GENERIC);
+        g_hTopMenu.AddItem("tjs_nerf_player", AdminMenu_NerfPlayer, g_togsCategory, "sm_capplayer", ADMFLAG_BAN);
+        g_hTopMenu.AddItem("tjs_unnerf_player", AdminMenu_UnnerfPlayer, g_togsCategory, "sm_removenerf", ADMFLAG_BAN);
+        g_hTopMenu.AddItem("tjs_whitelist_player", AdminMenu_WhitelistPlayer, g_togsCategory, "sm_whitelist", ADMFLAG_BAN);
+        g_hTopMenu.AddItem("tjs_removewhitelist_player", AdminMenu_RemoveWhitelistPlayer, g_togsCategory, "sm_removewhitelist", ADMFLAG_BAN);
+    }
+}
+
+public void AdminMenu_CategoryHandler(TopMenu topmenu, TopMenuAction action, TopMenuObject object_id, int client, char[] buffer, int maxlength)
+{
+    if (action == TopMenuAction_DisplayTitle)
+        Format(buffer, maxlength, "TOGs Jump Stats Commands:");
+    else if (action == TopMenuAction_DisplayOption)
+        Format(buffer, maxlength, "TOGs Jump Stats");
+}
+
+public void AdminMenu_CheckStats(TopMenu topmenu, TopMenuAction action, TopMenuObject object_id, int client, char[] buffer, int maxlength)
+{
+    if (action == TopMenuAction_DisplayOption)
+        Format(buffer, maxlength, "Check Player Jump Stats");
+    else if (action == TopMenuAction_SelectOption)
+        ShowPlayerSelectionMenu(client, "stats");
+}
+
+public void AdminMenu_ResetStats(TopMenu topmenu, TopMenuAction action, TopMenuObject object_id, int client, char[] buffer, int maxlength)
+{
+    if (action == TopMenuAction_DisplayOption)
+        Format(buffer, maxlength, "Reset Player Jump Stats");
+    else if (action == TopMenuAction_SelectOption)
+        ShowPlayerSelectionMenu(client, "reset");
+}
+
+public void AdminMenu_ObserveJumps(TopMenu topmenu, TopMenuAction action, TopMenuObject object_id, int client, char[] buffer, int maxlength)
+{
+    if (action == TopMenuAction_DisplayOption)
+        Format(buffer, maxlength, "Observe Player Jumps");
+    else if (action == TopMenuAction_SelectOption)
+        ShowPlayerSelectionMenu(client, "observe");
+}
+
+public void AdminMenu_NerfPlayer(TopMenu topmenu, TopMenuAction action, TopMenuObject object_id, int client, char[] buffer, int maxlength)
+{
+    if (action == TopMenuAction_DisplayOption)
+        Format(buffer, maxlength, "Nerf Player (Cap Speed)");
+    else if (action == TopMenuAction_SelectOption)
+        ShowPlayerSelectionMenu(client, "nerf");
+}
+
+public void AdminMenu_UnnerfPlayer(TopMenu topmenu, TopMenuAction action, TopMenuObject object_id, int client, char[] buffer, int maxlength)
+{
+    if (action == TopMenuAction_DisplayOption)
+        Format(buffer, maxlength, "Remove Player Nerf");
+    else if (action == TopMenuAction_SelectOption)
+        ShowPlayerSelectionMenu(client, "unnerf");
+}
+
+public void AdminMenu_WhitelistPlayer(TopMenu topmenu, TopMenuAction action, TopMenuObject object_id, int client, char[] buffer, int maxlength)
+{
+    if (action == TopMenuAction_DisplayOption)
+        Format(buffer, maxlength, "Whitelist Player");
+    else if (action == TopMenuAction_SelectOption)
+        ShowPlayerSelectionMenu(client, "whitelist");
+}
+
+public void AdminMenu_RemoveWhitelistPlayer(TopMenu topmenu, TopMenuAction action, TopMenuObject object_id, int client, char[] buffer, int maxlength)
+{
+    if (action == TopMenuAction_DisplayOption)
+        Format(buffer, maxlength, "Remove Player from Whitelist");
+    else if (action == TopMenuAction_SelectOption)
+        ShowPlayerSelectionMenu(client, "removewhitelist");
+}
+
+void ShowPlayerSelectionMenu(int client, const char[] action)
+{
+    Menu menu = new Menu(MenuHandler_PlayerSelection);
+    menu.SetTitle("Select Player for %s", action);
+    
+    char userid[12], display[64];
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (IsValidClient(i) && !IsFakeClient(i))
+        {
+            IntToString(GetClientUserId(i), userid, sizeof(userid));
+            Format(display, sizeof(display), "%N", i);
+            menu.AddItem(userid, display);
+        }
+    }
+    
+    menu.ExitBackButton = true;
+    menu.Display(client, MENU_TIME_FOREVER);
+}
+
+public int MenuHandler_PlayerSelection(Menu menu, MenuAction action, int client, int param2)
+{
+    if (action == MenuAction_Select)
+    {
+        char info[32];
+        menu.GetItem(param2, info, sizeof(info));
+        int target = GetClientOfUserId(StringToInt(info));
+        
+        if (!IsValidClient(target))
+        {
+            CPrintToChat(client, "%sPlayer is no longer available", TAG);
+            return 0;
+        }
+        
+        char actionType[32];
+        menu.GetTitle(actionType, sizeof(actionType));
+        
+        if (StrContains(actionType, "stats") != -1)
+        {
+            char stats[512];
+            GetClientStats(target, stats, sizeof(stats));
+            PrintToConsole(client, "Jump Stats for %N:\n%s", target, stats);
+            CPrintToChat(client, "%sCheck console for %N's jump stats", TAG, target);
+        }
+        else if (StrContains(actionType, "reset") != -1)
+        {
+            ResetJumps(target);
+            CPrintToChat(client, "%sReset jump stats for %N", TAG, target);
+        }
+        else if (StrContains(actionType, "observe") != -1)
+        {
+            if (IsPlayerAlive(client) && GetClientTeam(client) != 1)
+            {
+                Menu observeMenu = new Menu(MenuHandler_ObserveChoice);
+                observeMenu.SetTitle("Move to spectator to observe %N?", target);
+                observeMenu.AddItem(info, "Move Now");
+                observeMenu.AddItem(info, "Move at Round End");
+                observeMenu.AddItem("cancel", "Cancel");
+                observeMenu.ExitButton = false;
+                observeMenu.Display(client, MENU_TIME_FOREVER);
+            }
+            else
+            {
+                PerformObservation(client, target);
+            }
+        }
+        else if (StrContains(actionType, "nerf") != -1)
+        {
+            ShowNerfDurationMenu(client, target);
+        }
+        else if (StrContains(actionType, "unnerf") != -1)
+        {
+            if (ga_bNerfed[target])
+            {
+                SetClientNerfed(target, false);
+                CPrintToChat(client, "%sRemoved nerf from %N", TAG, target);
+                //CPrintToChat(target, "%s%sYour movement restrictions have been removed by an admin", 
+                //   TAG, g_bCSGO ? CSGO_RED : CSS_RED);
+            }
+            else
+            {
+                CPrintToChat(client, "%s%N is not currently nerfed", TAG, target);
+            }
+        }
+        else if (StrContains(actionType, "whitelist") != -1)
+        {
+            char steamId[32];
+            if (GetClientAuthId(target, AuthId_Steam2, steamId, sizeof(steamId)))
+            {
+                AddToWhitelist(steamId);
+                g_bClientWhitelisted[target] = true;
+                CPrintToChat(client, "%sAdded %N to whitelist", TAG, target);
+                //CPrintToChat(target, "%s%sYou have been whitelisted from jump stats detection", 
+                //    TAG, g_bCSGO ? CSGO_RED : CSS_RED);
+            }
+            else
+            {
+                CPrintToChat(client, "%sCould not get SteamID for %N", TAG, target);
+            }
+        }
+        else if (StrContains(actionType, "removewhitelist") != -1)
+        {
+            char steamId[32];
+            if (GetClientAuthId(target, AuthId_Steam2, steamId, sizeof(steamId)))
+            {
+                if (RemoveFromWhitelist(steamId))
+                {
+                    g_bClientWhitelisted[target] = false;
+                    CPrintToChat(client, "%sRemoved %N from whitelist", TAG, target);
+                    //CPrintToChat(target, "%s%sYou have been removed from the whitelist. Your jumps will now be monitored.", 
+                    //TAG, g_bCSGO ? CSGO_RED : CSS_RED);
+                }
+                else
+                {
+                    CPrintToChat(client, "%s%N is not currently whitelisted", TAG, target);
+                }
+            }
+            else
+            {
+                CPrintToChat(client, "%sCould not get SteamID for %N", TAG, target);
+            }
+        }
+    }
+    else if (action == MenuAction_Cancel && param2 == MenuCancel_ExitBack)
+    {
+        if (g_hTopMenu != null)
+            g_hTopMenu.Display(client, TopMenuPosition_LastCategory);
+    }
+    else if (action == MenuAction_End)
+    {
+        delete menu;
+    }
+    
+    return 0;
+}
+
+void ShowNerfDurationMenu(int client, int target)
+{
+    Menu menu = new Menu(MenuHandler_NerfDuration);
+    menu.SetTitle("Nerf Duration for %N", target);
+    
+    char userid[12];
+    IntToString(GetClientUserId(target), userid, sizeof(userid));
+    
+    menu.AddItem(userid, "Session (Until map change)", ga_bNerfed[target] && g_bRoundCapped[target] ? ITEMDRAW_DISABLED : ITEMDRAW_DEFAULT);
+    menu.AddItem(userid, "1 Minute");
+    menu.AddItem(userid, "5 Minutes");
+    menu.AddItem(userid, "30 Minutes");
+    menu.AddItem(userid, "1 Hour");
+    menu.AddItem(userid, "1 Day");
+    menu.AddItem(userid, "Permanent (Until removed)");
+    menu.AddItem("custom", "Custom Duration...");
+    
+    menu.ExitBackButton = true;
+    menu.Display(client, MENU_TIME_FOREVER);
+}
+
+public int MenuHandler_NerfDuration(Menu menu, MenuAction action, int client, int param2)
+{
+    if (action == MenuAction_Select)
+    {
+        char info[32];
+        menu.GetItem(param2, info, sizeof(info));
+        
+        int target = GetClientOfUserId(StringToInt(info));
+        if (!IsValidClient(target))
+        {
+            CPrintToChat(client, "%sPlayer is no longer available", TAG);
+            return 0;
+        }
+        
+        if (StrEqual(info, "custom"))
+        {
+            CPrintToChat(client, "%sEnter the duration in chat: !capplayer %N <duration>", TAG, target);
+            CPrintToChat(client, "%sDuration can be in seconds or format like \"1 day\", \"2 weeks\" etc.", TAG);
+            return 0;
+        }
+        
+        int duration = 0;
+        bool isRoundCap = false;
+        
+        switch (param2)
+        {
+            case 0: isRoundCap = true;
+            case 1: duration = 60;
+            case 2: duration = 300;
+            case 3: duration = 1800;
+            case 4: duration = 3600;
+            case 5: duration = 86400;
+            case 6: duration = 0;
+        }
+        
+        if (isRoundCap)
+        {
+            SetClientNerfed(target, true, true);
+            g_bRoundCapped[target] = true;
+            CPrintToChat(client, "%sCapped %N for the current session", TAG, target);
+        }
+        else
+        {
+            SetClientNerfed(target, true, false);
+            if (duration == 0)
+            {
+                g_bClientPermanentCapped[target] = true;
+                CPrintToChat(client, "%sPermanently capped %N", TAG, target);
+            }
+            else
+            {
+                CreateTimer(float(duration), Timer_RemoveCap, GetClientUserId(target));
+                CPrintToChat(client, "%sCapped %N for %d seconds", TAG, target, duration);
+            }
+            
+            char steamId[32];
+            if (GetClientAuthId(target, AuthId_Steam2, steamId, sizeof(steamId)))
+            {
+                int endTime = (duration == 0) ? 0 : (GetTime() + duration);
+                AddToCapList(steamId, endTime);
+            }
+        }
+        
+        //CPrintToChat(target, "%s%sYour movement has been restricted by an admin", 
+        //    TAG, g_bCSGO ? CSGO_RED : CSS_RED);
+    }
+    else if (action == MenuAction_Cancel && param2 == MenuCancel_ExitBack)
+    {
+        ShowPlayerSelectionMenu(client, "nerf");
+    }
+    else if (action == MenuAction_End)
+    {
+        delete menu;
+    }
+    
+    return 0;
+}
+
+stock bool RemoveFromWhitelist(const char[] steamId)
+{
+    switch (g_hStorageMethod.IntValue)
+    {
+        case STORAGE_FILE:
+        {
+            char path[PLATFORM_MAX_PATH];
+            BuildPath(Path_SM, path, sizeof(path), "configs/TogsJumpStats/whitelist.txt");
+            
+            File file = OpenFile(path, "r");
+            if (file == null)
+                return false;
+                
+            ArrayList tempList = new ArrayList(ByteCountToCells(32));
+            char line[32];
+            bool found = false;
+            
+            while (file.ReadLine(line, sizeof(line)))
+            {
+                TrimString(line);
+                if (StrEqual(line, steamId))
+                {
+                    found = true;
+                    continue;
+                }
+                tempList.PushString(line);
+            }
+            delete file;
+            
+            if (!found)
+            {
+                delete tempList;
+                return false;
+            }
+            
+            file = OpenFile(path, "w");
+            if (file == null)
+            {
+                delete tempList;
+                return false;
+            }
+            
+            for (int i = 0; i < tempList.Length; i++)
+            {
+                tempList.GetString(i, line, sizeof(line));
+                file.WriteLine(line);
+            }
+            delete file;
+            delete tempList;
+            return true;
+        }
+        case STORAGE_MYSQL:
+        {
+            char query[256];
+            Format(query, sizeof(query), "DELETE FROM togs_whitelist WHERE steamid = '%s'", steamId);
+            DataPack pack = new DataPack();
+            pack.WriteString(steamId);
+            SQL_TQuery(g_hWhitelistDB, SQL_CheckWhitelistRemovalCallback, query, pack);
+            return true;
+        }
+        case STORAGE_CLIENTPREFS:
+        {
+            for (int i = 1; i <= MaxClients; i++)
+            {
+                if (IsValidClient(i))
+                {
+                    char clientSteamId[32];
+                    if (GetClientAuthId(i, AuthId_Steam2, clientSteamId, sizeof(clientSteamId)) && StrEqual(steamId, clientSteamId))
+                    {
+                        SetClientCookie(i, g_hWhitelistCookie, "0");
+                        g_bClientWhitelisted[i] = false;
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+public void SQL_CheckWhitelistRemovalCallback(Handle owner, Handle hndl, const char[] error, DataPack pack)
+{
+    if (hndl == null || error[0])
+    {
+        LogError("Whitelist removal query failed: %s", error);
+        return;
+    }
+    
+    pack.Reset();
+    char steamId[32];
+    pack.ReadString(steamId, sizeof(steamId));
+    
+    if (SQL_GetAffectedRows(hndl) == 0)
+    {
+        LogMessage("No whitelist entry found for %s", steamId);
+    }
+    else
+    {
+        LogMessage("Successfully removed %s from whitelist", steamId);
+    }
+    delete pack;
+}
+
+// Map and Round End Handling
+public void OnMapEnd() 
+{ 
+    for (int client = 1; client <= MaxClients; client++) 
+    { 
+        if (IsValidClient(client)) 
+        { 
+            if (g_bRoundCapped[client]) 
+            { 
+                SetClientNerfed(client, false); 
+                g_bRoundCapped[client] = false; 
+            } 
+        } 
+    } 
+}
+
+public void Event_RoundEnd(Event event, const char[] name, bool dontBroadcast) 
+{ 
+    for (int client = 1; client <= MaxClients; client++) 
+    { 
+        if (IsValidClient(client)) 
+        { 
+            // Handle pending spectate 
+            if (g_bWaitingForRoundEnd[client]) 
+            { 
+                int target = GetClientOfUserId(g_iPendingSpectate[client]); 
+                if (IsValidClient(target) && IsPlayerAlive(target)) 
+                { 
+                    ChangeClientTeam(client, 1); 
+                    RequestFrame(Frame_ObserveAfterTeamChange, GetClientUserId(client)); 
+                } 
+                else 
+                { 
+                    CPrintToChat(client, "%sYour observation target is no longer available.", TAG); 
+                }
+
+                g_bWaitingForRoundEnd[client] = false;
+                g_iPendingSpectate[client] = 0;
+            }
+        
+            if (ga_bNerfed[client] && (g_bRoundCapped[client] || (!g_bClientPermanentCapped[client] && ga_hNerfTimers[client] == null)))
+            {
+                SetClientNerfed(client, false);
+                g_bRoundCapped[client] = false;
+                //CPrintToChat(client, "%s%sYour nerf has been removed at round end.", 
+                //    TAG, g_bCSGO ? CSGO_RED : CSS_RED);
+            }
+        }
+    }
+}
+
+public void OnClientCookiesCached(int client)
+{
+    if (!IsValidClient(client))
+        return;
+        
+    if (g_hStorageMethod.IntValue == STORAGE_CLIENTPREFS)
+    {
+        char steamId[32];
+        if (GetClientAuthId(client, AuthId_Steam2, steamId, sizeof(steamId)))
+        {
+            CheckWhitelist(client, steamId);
+            CheckCappedList(client, steamId);
+        }
+    }
 }
 
 public void OnAllPluginsLoaded()
@@ -350,24 +871,24 @@ stock bool SetClientNerfed(int client, bool set, bool isRoundCap = false)
             
             ga_hNerfTimers[client] = CreateTimer(timerDuration, Timer_RemoveNerf, client);
             
-            CPrintToChat(client, "%s%sYou have been nerfed and speed capped to %.0f for %.0f seconds due to cheat detection!", 
-                TAG, g_bCSGO ? CSGO_RED : CSS_RED, maxSpeed, timerDuration);
+            //CPrintToChat(client, "%s%sYou have been nerfed and speed capped to %.0f for %.0f seconds due to cheat detection!", 
+            //    TAG, g_bCSGO ? CSGO_RED : CSS_RED, maxSpeed, timerDuration);
         }
         else
         {
-            CPrintToChat(client, "%s%sYou have been %s and speed capped to %.0f!", 
-                TAG, g_bCSGO ? CSGO_RED : CSS_RED, 
-                isRoundCap ? "capped by an admin for the round" : "nerfed due to cheat detection",
-                maxSpeed);
+            //CPrintToChat(client, "%s%sYou have been %s and speed capped to %.0f!", 
+            //    TAG, g_bCSGO ? CSGO_RED : CSS_RED, 
+            //    isRoundCap ? "capped by an admin for the round" : "nerfed due to cheat detection",
+            //    maxSpeed);
         }
     }
     else if(!set && IsPlayerAlive(client))
     {
         char clientName[MAX_NAME_LENGTH];
         GetClientName(client, clientName, sizeof(clientName));
-        CPrintToChat(client, "%s%sYour %s has been removed!", 
-            TAG, g_bCSGO ? CSGO_RED : CSS_RED,
-            g_bRoundCapped[client] ? "round cap" : "nerf");
+        //CPrintToChat(client, "%s%sYour %s has been removed!", 
+        //    TAG, g_bCSGO ? CSGO_RED : CSS_RED,
+        //    g_bRoundCapped[client] ? "round cap" : "nerf");
             
         g_bRoundCapped[client] = false;
     }
@@ -384,7 +905,7 @@ public Action Timer_RemoveNerf(Handle timer, int client)
         
         char clientName[MAX_NAME_LENGTH];
         GetClientName(client, clientName, sizeof(clientName));
-        CPrintToChat(client, "%s%sNerf timer expired - restrictions removed!", TAG, g_bCSGO ? CSGO_RED : CSS_RED);
+        //CPrintToChat(client, "%s%sNerf timer expired - restrictions removed!", TAG, g_bCSGO ? CSGO_RED : CSS_RED);
     }
     
     return Plugin_Stop;
@@ -443,14 +964,14 @@ public Action Timer_CheckSpeed(Handle timer)
                     float timeRemaining = g_cvSpeedCapTimer.FloatValue - (GetGameTime() - ga_fNerfStartTime[i]);
                     if(timeRemaining > 0)
                     {
-                        CPrintToChat(i, "%s%sSpeed capped to %.0f (%.0fs remaining)!", 
-                            TAG, g_bCSGO ? CSGO_RED : CSS_RED, maxSpeed, timeRemaining);
+                        //CPrintToChat(i, "%s%sSpeed capped to %.0f (%.0fs remaining)!", 
+                        //    TAG, g_bCSGO ? CSGO_RED : CSS_RED, maxSpeed, timeRemaining);
                     }
                 }
                 else
                 {
-                    CPrintToChat(i, "%s%sSpeed capped to %.0f due to cheat detection!", 
-                        TAG, g_bCSGO ? CSGO_RED : CSS_RED, maxSpeed);
+                    //CPrintToChat(i, "%s%sSpeed capped to %.0f due to cheat detection!", 
+                    //    TAG, g_bCSGO ? CSGO_RED : CSS_RED, maxSpeed);
                 }
             }
         }
@@ -512,39 +1033,6 @@ public Action Event_RoundStart(Handle hEvent, const char[] sName, bool bDontBroa
     return Plugin_Continue;
 }
 
-
-public void Event_RoundEnd(Event event, const char[] name, bool dontBroadcast)
-{
-    for (int client = 1; client <= MaxClients; client++)
-    {
-        if (g_bWaitingForRoundEnd[client] && IsValidClient(client))
-        {
-            int target = GetClientOfUserId(g_iPendingSpectate[client]);
-            if (IsValidClient(target) && IsPlayerAlive(target))
-            {
-                ChangeClientTeam(client, 1);
-                RequestFrame(Frame_ObserveAfterTeamChange, GetClientUserId(client));
-            }
-            else
-            {
-                CPrintToChat(client, "%sYour observation target is no longer available.", TAG);
-            }
-            
-            g_bWaitingForRoundEnd[client] = false;
-            g_iPendingSpectate[client] = 0;
-        }
-    }
-
-    for (int client = 1; client <= MaxClients; client++)
-    {
-        if (IsValidClient(client) && g_bRoundCapped[client])
-        {
-            SetClientNerfed(client, false);
-            g_bRoundCapped[client] = false;
-        }
-    }
-}
-
 public int ClientConVar(QueryCookie cookie, int client, ConVarQueryResult result, const char[] sCVarName, const char[] sCVarValue)
 {
     float fValue = StringToFloat(sCVarValue);
@@ -579,10 +1067,229 @@ public void OnClientPutInServer(int client)
 
 public void OnClientPostAdminCheck(int client)
 {
-    if(HasFlags(client, g_sAdminFlag))
+    if (IsFakeClient(client))
+        return;
+        
+    char steamId[32];
+    if (!GetClientAuthId(client, AuthId_Steam2, steamId, sizeof(steamId)))
+        return;
+    
+    if (g_hWhitelistEnabled.BoolValue)
     {
-        CreateTimer(15.0, TimerCB_CheckForFlags, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
+        CheckWhitelist(client, steamId);
     }
+    
+    CheckCappedList(client, steamId);
+    
+    if (ga_bNerfed[client])
+    {
+        CreateTimer(10.0, Timer_NotifyPlayer, GetClientUserId(client));
+    }
+}
+
+public Action Timer_NotifyPlayer(Handle timer, any userid)
+{
+    int client = GetClientOfUserId(userid);
+    if (client == 0 || !IsClientInGame(client))
+        return Plugin_Stop;
+    
+    if (g_bClientPermanentCapped[client])
+    {
+        //CPrintToChat(client, "%s%sYour movement is PERMANENTLY capped due to cheat detection!", TAG, g_bCSGO ? CSGO_RED : CSS_RED);
+    }
+    else if (ga_bNerfed[client])
+    {
+        if (ga_hNerfTimers[client] != null)
+        {
+            float timeRemaining = g_cvSpeedCapTimer.FloatValue - (GetGameTime() - ga_fNerfStartTime[client]);
+            if (timeRemaining > 0)
+            {
+                //CPrintToChat(client, "%s%sYour movement is capped for %.0f more seconds due to cheat detection!", 
+                //    TAG, g_bCSGO ? CSGO_RED : CSS_RED, timeRemaining);
+            }
+        }
+    }
+    
+    return Plugin_Stop;
+}
+
+void CheckWhitelist(int client, const char[] steamId)
+{
+    switch (g_hStorageMethod.IntValue)
+    {
+        case STORAGE_FILE:
+        {
+            char path[PLATFORM_MAX_PATH];
+            BuildPath(Path_SM, path, sizeof(path), "configs/TogsJumpStats/whitelist.txt");
+            
+            File file = OpenFile(path, "r");
+            if (file != null)
+            {
+                char line[32];
+                while (!file.EndOfFile() && file.ReadLine(line, sizeof(line)))
+                {
+                    TrimString(line);
+                    if (StrEqual(line, steamId))
+                    {
+                        g_bClientWhitelisted[client] = true;
+                        break;
+                    }
+                }
+                delete file;
+            }
+        }
+        case STORAGE_MYSQL:
+        {
+            if (g_hWhitelistDB == null)
+                return;
+                
+            char query[128];
+            Format(query, sizeof(query), "SELECT steamid FROM togs_whitelist WHERE steamid = '%s'", steamId);
+            SQL_TQuery(g_hWhitelistDB, SQL_CheckWhitelistCallback, query, GetClientUserId(client));
+        }
+        case STORAGE_CLIENTPREFS:
+        {
+            char cookieValue[8];
+            GetClientCookie(client, g_hWhitelistCookie, cookieValue, sizeof(cookieValue));
+            g_bClientWhitelisted[client] = (StrEqual(cookieValue, "1"));
+        }
+    }
+}
+
+public void SQL_CheckWhitelistCallback(Handle owner, Handle hndl, const char[] error, any userid)
+{
+    if (hndl == null)
+    {
+        LogError("SQL Error (CheckWhitelist): %s", error);
+        return;
+    }
+    
+    int client = GetClientOfUserId(userid);
+    if (client == 0)
+        return;
+        
+    if (SQL_GetRowCount(hndl) > 0)
+    {
+        g_bClientWhitelisted[client] = true;
+    }
+}
+
+void CheckCappedList(int client, const char[] steamId)
+{
+    switch (g_hStorageMethod.IntValue)
+    {
+        case STORAGE_FILE:
+        {
+            char path[PLATFORM_MAX_PATH];
+            BuildPath(Path_SM, path, sizeof(path), "configs/TogsJumpStats/capped.txt");
+            
+            File file = OpenFile(path, "r");
+            if (file != null)
+            {
+                char line[64];
+                while (!file.EndOfFile() && file.ReadLine(line, sizeof(line)))
+                {
+                    char parts[2][32];
+                    if (ExplodeString(line, " ", parts, 2, 32) == 2)
+                    {
+                        if (StrEqual(parts[0], steamId))
+                        {
+                            int endTime = StringToInt(parts[1]);
+                            if (endTime == 0 || endTime > GetTime())
+                            {
+                                SetClientNerfed(client, true, false);
+                                if (endTime == 0)
+                                {
+                                    g_bClientPermanentCapped[client] = true;
+                                }
+                                else
+                                {
+                                    int remaining = endTime - GetTime();
+                                    CreateTimer(float(remaining), Timer_RemoveCap, GetClientUserId(client));
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                delete file;
+            }
+        }
+        case STORAGE_MYSQL:
+        {
+            if (g_hCapDB == null)
+                return;
+                
+            char query[128];
+            Format(query, sizeof(query), "SELECT end_time FROM togs_capped WHERE steamid = '%s'", steamId);
+            SQL_TQuery(g_hCapDB, SQL_CheckCappedCallback, query, GetClientUserId(client));
+        }
+        case STORAGE_CLIENTPREFS:
+        {
+            char cookieValue[32];
+            GetClientCookie(client, g_hCapCookie, cookieValue, sizeof(cookieValue));
+            
+            if (strlen(cookieValue) > 0)
+            {
+                int endTime = StringToInt(cookieValue);
+                if (endTime == 0 || endTime > GetTime())
+                {
+                    SetClientNerfed(client, true, false);
+                    if (endTime == 0)
+                    {
+                        g_bClientPermanentCapped[client] = true;
+                    }
+                    else
+                    {
+                        int remaining = endTime - GetTime();
+                        CreateTimer(float(remaining), Timer_RemoveCap, GetClientUserId(client));
+                    }
+                }
+            }
+        }
+    }
+}
+
+public void SQL_CheckCappedCallback(Handle owner, Handle hndl, const char[] error, any userid)
+{
+    if (hndl == null)
+    {
+        LogError("SQL Error (CheckCapped): %s", error);
+        return;
+    }
+    
+    int client = GetClientOfUserId(userid);
+    if (client == 0)
+        return;
+        
+    if (SQL_FetchRow(hndl))
+    {
+        int endTime = SQL_FetchInt(hndl, 0);
+        if (endTime == 0 || endTime > GetTime())
+        {
+            SetClientNerfed(client, true, false);
+            if (endTime == 0)
+            {
+                g_bClientPermanentCapped[client] = true;
+            }
+            else
+            {
+                int remaining = endTime - GetTime();
+                CreateTimer(float(remaining), Timer_RemoveCap, userid);
+            }
+        }
+    }
+}
+
+public Action Timer_RemoveCap(Handle timer, any userid)
+{
+    int client = GetClientOfUserId(userid);
+    if (client != 0 && IsClientInGame(client))
+    {
+        SetClientNerfed(client, false);
+        g_bClientPermanentCapped[client] = false;
+    }
+    return Plugin_Stop;
 }
 
 public Action TimerCB_CheckForFlags(Handle hTimer, any iUserID)
@@ -600,7 +1307,6 @@ public Action TimerCB_CheckForFlags(Handle hTimer, any iUserID)
             {
                 iCount++;
                 
-                // Get player info
                 char sName[MAX_NAME_LENGTH];
                 char sSteamID[32];
                 char sTeam[16];
@@ -616,7 +1322,6 @@ public Action TimerCB_CheckForFlags(Handle hTimer, any iUserID)
                     default: strcopy(sTeam, sizeof(sTeam), "UNK");
                 }
                 
-                // Format player info line
                 Format(sPlayerInfo, sizeof(sPlayerInfo), "#%d %d %s <%s> <%s>\n", 
                     iCount, 
                     GetClientUserId(i),
@@ -626,7 +1331,6 @@ public Action TimerCB_CheckForFlags(Handle hTimer, any iUserID)
                 
                 StrCat(sFlaggedPlayers, sizeof(sFlaggedPlayers), sPlayerInfo);
                 
-                // Add jump stats
                 char sStats[300];
                 GetClientStats(i, sStats, sizeof(sStats));
                 StrCat(sFlaggedPlayers, sizeof(sFlaggedPlayers), sStats);
@@ -653,6 +1357,18 @@ public void Event_PlayerJump(Handle hEvent, const char[] sName, bool bDontBroadc
     
     if (!IsValidClient(client))
     {
+        return;
+    }
+
+    if (g_bClientWhitelisted[client] || g_bClientIgnored[client])
+    {
+        //DebugLog("Skipping detection for client %d (whitelisted or ignored)", client);
+        return;
+    }
+
+    if (g_hDisableHyperscroll.BoolValue && ga_fAvgJumps[client] > 14.0 && ga_fAvgPerfJumps[client] >= g_hHypPerf.FloatValue)
+    {
+        //DebugLog("Skipping hyperscroll detection for client %d (feature disabled)", client);
         return;
     }
     
@@ -845,45 +1561,273 @@ public Action Command_MsgStatus(int client, int iArgs)
     return Plugin_Handled;
 }
 
-public Action Command_CapPlayer(int client, int args)
+// Cap Player Command
+public Action Command_CapPlayer(int client, int args) 
+{ 
+    if (!HasFlags(client, g_sAdminFlag) && IsValidClient(client)) 
+    { 
+        CReplyToCommand(client, "%sYou do not have access to this command!", TAG); 
+        return Plugin_Handled; 
+    }
+
+    if (args < 2)
+    {
+        CReplyToCommand(client, "%sUsage: sm_capplayer <player> <time|session|0>", TAG);
+        CReplyToCommand(client, "%sTime can be in seconds or format like \"1 day\", \"2 weeks\" etc.", TAG);
+        return Plugin_Handled;
+    }
+
+    char targetArg[65], timeArg[32];
+    GetCmdArg(1, targetArg, sizeof(targetArg));
+    GetCmdArg(2, timeArg, sizeof(timeArg));
+
+    int targetClient = FindTarget(client, targetArg, true, false);
+    if (targetClient == -1)
+    {
+        return Plugin_Handled;
+    }
+
+    int time = 0;
+    bool isSessionCap = false;
+    bool isPermanent = false;
+
+    if (StrEqual(timeArg, "session", false))
+    {
+        isSessionCap = true;
+    }
+    else if (StringToIntEx(timeArg, time) == 0)
+    {
+        time = ParseTimeString(timeArg);
+        if (time == 0 && !StrEqual(timeArg, "0"))
+        {
+            CReplyToCommand(client, "%sInvalid time format. Use seconds, 0 (permanent), session, or format like \"1 day\"", TAG);
+            return Plugin_Handled;
+        }
+    }
+
+    if (StrEqual(timeArg, "0"))
+    {
+        isPermanent = true;
+    }
+
+    SetClientNerfed(targetClient, true, isSessionCap);
+
+    if (isPermanent)
+    {
+        g_bClientPermanentCapped[targetClient] = true;
+        char steamId[32];
+        if (GetClientAuthId(targetClient, AuthId_Steam2, steamId, sizeof(steamId)))
+        {
+            AddToCapList(steamId, 0);
+        }
+        CReplyToCommand(client, "%sPermanently capped player %N", TAG, targetClient);
+    }
+    else if (isSessionCap)
+    {
+        g_bRoundCapped[targetClient] = true;
+        CReplyToCommand(client, "%sCapped player %N for the current session (until round end)", TAG, targetClient);
+    }
+    else
+    {
+        CreateTimer(float(time), Timer_RemoveCap, GetClientUserId(targetClient));
+        char steamId[32];
+        if (GetClientAuthId(targetClient, AuthId_Steam2, steamId, sizeof(steamId)))
+        {
+            int endTime = GetTime() + time;
+            AddToCapList(steamId, endTime);
+        }
+        CReplyToCommand(client, "%sCapped player %N for %d seconds", TAG, targetClient, time);
+    }
+
+    //CPrintToChat(targetClient, "%s%sYour movement has been restricted by an admin", 
+    //    TAG, g_bCSGO ? CSGO_RED : CSS_RED);
+
+    return Plugin_Handled;
+}
+
+// Remove Whitelist Command
+public Action Command_RemoveWhitelist(int client, int args)
 {
-    if(!HasFlags(client, g_sAdminFlag) && IsValidClient(client))
+    if (!HasFlags(client, g_sAdminFlag) && IsValidClient(client))
     {
         CReplyToCommand(client, "%sYou do not have access to this command!", TAG);
         return Plugin_Handled;
     }
 
-    if(args < 1)
+    if (args < 1)
     {
-        CReplyToCommand(client, "%sUsage: sm_capplayer <player>", TAG);
+        CReplyToCommand(client, "%sUsage: sm_removewhitelist <player>", TAG);
         return Plugin_Handled;
     }
     
-    char target[65];
-    GetCmdArg(1, target, sizeof(target));
+    char targetArg[65];
+    GetCmdArg(1, targetArg, sizeof(targetArg));
     
-    int targetClient = FindTarget(client, target, true, false);
-    if(targetClient == -1)
+    int targetClient = FindTarget(client, targetArg, true, false);
+    if (targetClient == -1)
     {
         return Plugin_Handled;
     }
     
-    if(ga_bNerfed[targetClient] && g_bRoundCapped[targetClient])
+    char steamId[32];
+    if (GetClientAuthId(targetClient, AuthId_Steam2, steamId, sizeof(steamId)))
     {
-        CReplyToCommand(client, "%sPlayer is already capped for the round.", TAG);
-        return Plugin_Handled;
+        if (RemoveFromWhitelist(steamId))
+        {
+            g_bClientWhitelisted[targetClient] = false;
+            CReplyToCommand(client, "%sRemoved %N from whitelist", TAG, targetClient);
+            //CPrintToChat(targetClient, "%s%sYou have been removed from the whitelist. Your jumps will now be monitored.", 
+            //    TAG, g_bCSGO ? CSGO_RED : CSS_RED);
+        }
+        else
+        {
+            CReplyToCommand(client, "%s%N is not currently whitelisted", TAG, targetClient);
+        }
     }
-    
-    SetClientNerfed(targetClient, true, true);
-    
-    char clientName[MAX_NAME_LENGTH], targetName[MAX_NAME_LENGTH];
-    GetClientName(client, clientName, sizeof(clientName));
-    GetClientName(targetClient, targetName, sizeof(targetName));
-    
-    CReplyToCommand(client, "%sCapped player %s for the round", TAG, targetName);
-    LogAction(client, targetClient, "\"%L\" capped player \"%L\" for the round", client, targetClient);
+    else
+    {
+        CReplyToCommand(client, "%sCould not get SteamID for %N", TAG, targetClient);
+    }
     
     return Plugin_Handled;
+}
+
+int ParseTimeString(const char[] timeStr)
+{
+    char buffer[32];
+    strcopy(buffer, sizeof(buffer), timeStr);
+    
+    int value;
+    char unit[32];
+    
+    if (SplitString(buffer, " ", unit, sizeof(unit)) == -1)
+    {
+        return 0;
+    }
+    
+    value = StringToInt(buffer);
+    if (value <= 0)
+    {
+        return 0;
+    }
+    
+    if (StrContains(unit, "sec", false) == 0) return value;
+    if (StrContains(unit, "min", false) == 0) return value * 60;
+    if (StrContains(unit, "hour", false) == 0) return value * 3600;
+    if (StrContains(unit, "day", false) == 0) return value * 86400;
+    if (StrContains(unit, "week", false) == 0) return value * 604800;
+    if (StrContains(unit, "month", false) == 0) return value * 2592000;
+    if (StrContains(unit, "year", false) == 0) return value * 31536000;
+    
+    return 0;
+}
+
+void AddToCapList(const char[] steamId, int endTime)
+{
+    switch (g_hStorageMethod.IntValue)
+    {
+        case STORAGE_FILE:
+        {
+            char path[PLATFORM_MAX_PATH];
+            BuildPath(Path_SM, path, sizeof(path), "configs/TogsJumpStats/capped.txt");
+            
+            File file = OpenFile(path, "a+");
+            if (file != null)
+            {
+                file.WriteLine("%s %d", steamId, endTime);
+                delete file;
+            }
+        }
+        case STORAGE_MYSQL:
+        {
+            char query[256];
+            Format(query, sizeof(query), "INSERT INTO togs_capped (steamid, end_time) VALUES ('%s', %d) ON DUPLICATE KEY UPDATE end_time = %d", 
+                steamId, endTime, endTime);
+            SQL_TQuery(g_hCapDB, SQL_ErrorCheckCallback, query);
+        }
+        case STORAGE_CLIENTPREFS:
+        {
+            for (int i = 1; i <= MaxClients; i++)
+            {
+                if (IsValidClient(i))
+                {
+                    char clientSteamId[32];
+                    if (GetClientAuthId(i, AuthId_Steam2, clientSteamId, sizeof(clientSteamId)) && StrEqual(steamId, clientSteamId))
+                    {
+                        char cookieValue[32];
+                        Format(cookieValue, sizeof(cookieValue), "%d", endTime);
+                        SetClientCookie(i, g_hCapCookie, cookieValue);
+                        
+                        SetClientNerfed(i, true, false);
+                        if (endTime == 0)
+                        {
+                            g_bClientPermanentCapped[i] = true;
+                        }
+                        else
+                        {
+                            int remaining = endTime - GetTime();
+                            CreateTimer(float(remaining), Timer_RemoveCap, GetClientUserId(i));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+public void OnConfigsExecuted()
+{
+    if (g_hStorageMethod.IntValue == STORAGE_MYSQL)
+    {
+        char dbName[64];
+        g_hDatabaseName.GetString(dbName, sizeof(dbName));
+        
+        if (SQL_CheckConfig(dbName))
+        {
+            Database.Connect(SQL_OnConnect, dbName);
+        }
+        else
+        {
+            LogError("Database configuration '%s' not found, falling back to file storage", dbName);
+            g_hStorageMethod.IntValue = STORAGE_FILE;
+        }
+    }
+}
+
+public void SQL_OnConnect(Database db, const char[] error, any data)
+{
+    if (db == null)
+    {
+        LogError("Database connection failed: %s", error);
+        g_hStorageMethod.IntValue = STORAGE_FILE;
+        return;
+    }
+    
+    g_hWhitelistDB = db;
+    g_hCapDB = db;
+    
+    char query[512];
+    Format(query, sizeof(query), 
+        "CREATE TABLE IF NOT EXISTS togs_whitelist ( \
+            steamid VARCHAR(32) NOT NULL PRIMARY KEY \
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    SQL_TQuery(db, SQL_ErrorCheckCallback, query);
+    
+    Format(query, sizeof(query), 
+        "CREATE TABLE IF NOT EXISTS togs_capped ( \
+            steamid VARCHAR(32) NOT NULL PRIMARY KEY, \
+            end_time INT NOT NULL \
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    SQL_TQuery(db, SQL_ErrorCheckCallback, query);
+}
+
+public void SQL_ErrorCheckCallback(Handle owner, Handle hndl, const char[] error, any data)
+{
+    if (!StrEqual(error, ""))
+    {
+        LogError("SQL Error: %s", error);
+    }
 }
 
 public Action Command_RemoveNerf(int client, int args)
@@ -1661,6 +2605,72 @@ public Action Timer_UpdateObserver(Handle timer, DataPack pack)
     return Plugin_Continue;
 }
 
+public Action Command_Whitelist(int client, int args)
+{
+    if (args < 1)
+    {
+        CReplyToCommand(client, "%sUsage: sm_whitelist <player>", TAG);
+        return Plugin_Handled;
+    }
+
+    char target[65];
+    GetCmdArg(1, target, sizeof(target));
+    
+    int targetClient = FindTarget(client, target, true, false);
+    if (targetClient == -1)
+    {
+        return Plugin_Handled;
+    }
+
+    char steamId[32];
+    if (!GetClientAuthId(targetClient, AuthId_Steam2, steamId, sizeof(steamId)))
+    {
+        CReplyToCommand(client, "%sCould not get SteamID for player", TAG);
+        return Plugin_Handled;
+    }
+
+    AddToWhitelist(steamId);
+    g_bClientWhitelisted[targetClient] = true;
+    
+    CReplyToCommand(client, "%sAdded %N to whitelist", TAG, targetClient);
+    return Plugin_Handled;
+}
+
+public Action Command_WhitelistPlayer(int client, int args)
+{
+    if (args < 1)
+    {
+        CReplyToCommand(client, "%sUsage: sm_whitelist_player <steamid>", TAG);
+        return Plugin_Handled;
+    }
+
+    char steamId[32];
+    GetCmdArg(1, steamId, sizeof(steamId));
+    
+    if (!IsValidSteamID(steamId))
+    {
+        CReplyToCommand(client, "%sInvalid SteamID format", TAG);
+        return Plugin_Handled;
+    }
+
+    AddToWhitelist(steamId);
+    
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (IsValidClient(i))
+        {
+            char clientSteamId[32];
+            if (GetClientAuthId(i, AuthId_Steam2, clientSteamId, sizeof(clientSteamId)) && StrEqual(steamId, clientSteamId))
+            {
+                g_bClientWhitelisted[i] = true;
+            }
+        }
+    }
+    
+    CReplyToCommand(client, "%sAdded SteamID %s to whitelist", TAG, steamId);
+    return Plugin_Handled;
+}
+
 public Action Command_ResetJumps(int client, int iArgs)
 {
     if(iArgs != 1)
@@ -1982,6 +2992,47 @@ public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float a_fVe
     return Plugin_Continue;
 }
 
+void AddToWhitelist(const char[] steamId)
+{
+    switch (g_hStorageMethod.IntValue)
+    {
+        case STORAGE_FILE:
+        {
+            char path[PLATFORM_MAX_PATH];
+            BuildPath(Path_SM, path, sizeof(path), "configs/TogsJumpStats/whitelist.txt");
+            
+            File file = OpenFile(path, "a+");
+            if (file != null)
+            {
+                file.WriteLine(steamId);
+                delete file;
+            }
+        }
+        case STORAGE_MYSQL:
+        {
+            char query[256];
+            Format(query, sizeof(query), "INSERT INTO togs_whitelist (steamid) VALUES ('%s') ON DUPLICATE KEY UPDATE steamid = steamid", steamId);
+            SQL_TQuery(g_hWhitelistDB, SQL_ErrorCheckCallback, query);
+        }
+        case STORAGE_CLIENTPREFS:
+        {
+            for (int i = 1; i <= MaxClients; i++)
+            {
+                if (IsValidClient(i))
+                {
+                    char clientSteamId[32];
+                    if (GetClientAuthId(i, AuthId_Steam2, clientSteamId, sizeof(clientSteamId)) && StrEqual(steamId, clientSteamId))
+                    {
+                        SetClientCookie(i, g_hWhitelistCookie, "1");
+                        g_bClientWhitelisted[i] = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 bool HasFlags(int client, char[] sFlags)
 {
     if(StrEqual(sFlags, "public", false) || StrEqual(sFlags, "", false))
@@ -2142,6 +3193,59 @@ public int Native_ClientNerfed(Handle plugin, int numParams)
 	return result;
 }
 
+public int Native_ClientIsPermanentCapped(Handle plugin, int numParams)
+{
+    int client = GetNativeCell(1);
+    if (!IsValidClient(client))
+    {
+        DebugLog("Native_ClientIsPermanentCapped: Invalid client %d", client);
+        return false;
+    }
+    
+    DebugLog("Native_ClientIsPermanentCapped: Client %d is %s", client, g_bClientPermanentCapped[client] ? "permanently capped" : "not permanently capped");
+    return g_bClientPermanentCapped[client];
+}
+
+public int Native_ClientIsWhitelisted(Handle plugin, int numParams)
+{
+    int client = GetNativeCell(1);
+    if (!IsValidClient(client))
+    {
+        DebugLog("Native_ClientIsWhitelisted: Invalid client %d", client);
+        return false;
+    }
+    
+    DebugLog("Native_ClientIsWhitelisted: Client %d is %s", client, g_bClientWhitelisted[client] ? "whitelisted" : "not whitelisted");
+    return g_bClientWhitelisted[client];
+}
+
+public int Native_IgnoreClient(Handle plugin, int numParams)
+{
+    int client = GetNativeCell(1);
+    bool ignore = GetNativeCell(2);
+    
+    if (!IsValidClient(client))
+    {
+        DebugLog("Native_IgnoreClient: Invalid client %d", client);
+        return false;
+    }
+    
+    DebugLog("Native_IgnoreClient: Setting client %d ignore status to %d", client, ignore);
+    g_bClientIgnored[client] = ignore;
+    return true;
+}
+
+void DebugLog(const char[] format, any ...)
+{
+    char buffer[256];
+    VFormat(buffer, sizeof(buffer), format, 2);
+    
+    char path[PLATFORM_MAX_PATH];
+    BuildPath(Path_SM, path, sizeof(path), "logs/togsjumpstats_debug.log");
+    
+    LogToFileEx(path, "%s", buffer);
+}
+
 
 int FindAlivePlayer()
 {
@@ -2153,6 +3257,11 @@ int FindAlivePlayer()
         }
     }
     return -1;
+}
+
+bool IsValidSteamID(const char[] steamId)
+{
+    return (StrContains(steamId, "STEAM_") == 0) || (StrContains(steamId, "[U:") == 0);
 }
 
 /*
@@ -2236,4 +3345,15 @@ CHANGE LOG
 
 1.11.1
     * Added two commands: sm_capplayer and sm_removenerfs.
+
+1.11.2
+    * Add cfg option to disable hyperscroll detection...maybe if jumps is set to 0?
+	* Code in natives to ignore a client. This would allow other plugins to ignore them, give them bhop hacks, later turn off hacks, then re-enable this plugin checking them.
+    * Added sm_whitelist command to whitelist players by SteamID.
+    * Added sm_whitelist_player command to whitelist players by SteamID directly.
+    * Added sm_removewhitelist command to remove players from the whitelist.
+    * Added ConVar to set the storage method for the whitelist (file, MySQL, or clientprefs).
+    * Added ConVar to set the database name for MySQL storage.
+    * Added 3 Natives: Native_ClientIsPermanentCapped, Native_ClientIsWhiteListed, and Native_IgnoreClient.
+    * Added Admin Menu and added plugin commands in the menu.
 */
