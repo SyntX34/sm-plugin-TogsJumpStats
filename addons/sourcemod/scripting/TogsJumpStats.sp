@@ -1083,9 +1083,11 @@ public void OnClientPostAdminCheck(int client)
     
     if (ga_bNerfed[client])
     {
-        CreateTimer(10.0, Timer_NotifyPlayer, GetClientUserId(client));
+        //CreateTimer(10.0, Timer_NotifyPlayer, GetClientUserId(client));
     }
 }
+
+/*
 
 public Action Timer_NotifyPlayer(Handle timer, any userid)
 {
@@ -1112,6 +1114,8 @@ public Action Timer_NotifyPlayer(Handle timer, any userid)
     
     return Plugin_Stop;
 }
+
+*/
 
 void CheckWhitelist(int client, const char[] steamId)
 {
